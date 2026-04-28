@@ -8,6 +8,7 @@ import faiss
 import numpy as np
 
 from config import IndexConfig
+from evaluate import cluster_size_stats
 
 # ---------------------------------------------------------------------------
 # Dataset presets
@@ -36,20 +37,6 @@ def _factory_string(config: IndexConfig) -> str:
         return f"OPQ{config.M}_{config.d},{ivf},{pq}"
     return f"{ivf},{pq}"
 
-
-def _cluster_size_stats(index: faiss.Index) -> dict:
-    # extract_index_ivf unwraps IndexPreTransform (OPQ) to reach the IVF layer
-    ivf = faiss.extract_index_ivf(index)
-    sizes = np.array([ivf.get_list_size(i) for i in range(ivf.nlist)])
-    mean = float(sizes.mean())
-    return {
-        "min":           int(sizes.min()),
-        "max":           int(sizes.max()),
-        "mean":          round(mean, 2),
-        "std":           round(float(sizes.std()), 2),
-        "balance_ratio": round(float(sizes.std() / mean), 3),
-        "empty_lists":   int((sizes == 0).sum()),
-    }
 
 
 def _print_speedup_tips(config: IndexConfig) -> None:
@@ -139,7 +126,7 @@ def build_index(
         "ntotal":                  index.ntotal,
         "opq":                     config.opq,
         "subspace_variance_ratio": None,  # patched by caller via evaluate.opq_needed()
-        "cluster_size_stats":      _cluster_size_stats(index),
+        "cluster_size_stats":      cluster_size_stats(index),
         "timing": {
             "train_s": round(train_s, 2),
             "add_s":   round(add_s, 2),
