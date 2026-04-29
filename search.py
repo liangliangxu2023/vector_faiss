@@ -1,5 +1,7 @@
 """KNN search over a FAISS IVF/PQ index."""
 
+import time
+
 import numpy as np
 import faiss
 
@@ -39,27 +41,46 @@ def search_batch(
     k: int,
     nprobe: int = 16,
     batch_size: int = 1000,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Same as search() but processes queries in batches.
+    timeout_s: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Same as search() but processes queries in batches with progress logging and early stop.
 
-    Useful when nq is large and you want bounded peak memory or intermediate
-    progress logging.
+    Args:
+        timeout_s: Stop after this many seconds and return partial results.
+                   None = no limit.
+
+    Returns:
+        indices:    int64 array (nq, k) — -1 for unprocessed rows on early stop.
+        distances:  float32 array (nq, k) — 0.0 for unprocessed rows on early stop.
+        n_searched: number of queries actually searched (< nq on early stop).
     """
     nq = len(queries)
-    all_indices   = np.empty((nq, k), dtype=np.int64)
-    all_distances = np.empty((nq, k), dtype=np.float32)
+    all_indices   = np.full((nq, k), -1, dtype=np.int64)
+    all_distances = np.zeros((nq, k), dtype=np.float32)
 
     ivf = faiss.extract_index_ivf(index)
     ivf.nprobe = nprobe
     _warn_k(index, k, nprobe)
+
+    t0 = time.perf_counter()
+    n_searched = 0
 
     for start in range(0, nq, batch_size):
         end = min(start + batch_size, nq)
         d, i = index.search(queries[start:end], k)
         all_distances[start:end] = d
         all_indices[start:end]   = i
+        n_searched = end
 
-    return all_indices, all_distances
+        elapsed = time.perf_counter() - t0
+        qps = n_searched / elapsed
+        print(f"  searched {n_searched:,}/{nq:,}  ({elapsed:.1f}s, {qps:.0f} QPS)")
+
+        if timeout_s is not None and elapsed >= timeout_s:
+            print(f"  early stop: {elapsed:.1f}s >= {timeout_s}s ({n_searched:,}/{nq:,} queries done)")
+            break
+
+    return all_indices, all_distances, n_searched
 
 
 # ---------------------------------------------------------------------------

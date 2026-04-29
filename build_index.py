@@ -23,7 +23,19 @@ SPACEV_10M_CONFIG = IndexConfig(
 )
 
 SPACEV_100M_CONFIG = IndexConfig(
-    d=100, nlist=65536, M=25, metric="L2", train_size=1_000_000
+    d=100, nlist=65536, M=25, metric="L2", train_size=3_000_000
+)
+
+SPACEV_100M_HNSW_CONFIG = IndexConfig(
+    d=100, nlist=65536, M=25, metric="L2", train_size=3_000_000, hnsw_m=32
+)
+
+SPACEV_100M_HNSW64_CONFIG = IndexConfig(
+    d=100, nlist=65536, M=25, metric="L2", train_size=3_000_000, hnsw_m=64
+)
+
+SPACEV_1B_CONFIG = IndexConfig(
+    d=100, nlist=262_144, M=25, metric="L2", train_size=10_000_000, hnsw_m=32
 )
 
 # ---------------------------------------------------------------------------
@@ -31,8 +43,11 @@ SPACEV_100M_CONFIG = IndexConfig(
 # ---------------------------------------------------------------------------
 
 def _factory_string(config: IndexConfig) -> str:
-    ivf = f"IVF{config.nlist}"
-    pq  = f"PQ{config.M}"
+    if config.hnsw_m > 0:
+        ivf = f"IVF{config.nlist}_HNSW{config.hnsw_m}"
+    else:
+        ivf = f"IVF{config.nlist}"
+    pq = f"PQ{config.M}"
     if config.opq:
         return f"OPQ{config.M}_{config.d},{ivf},{pq}"
     return f"{ivf},{pq}"
@@ -72,8 +87,9 @@ def build_index(
     # --- create index ---
     metric_flag = faiss.METRIC_INNER_PRODUCT if config.metric == "IP" else faiss.METRIC_L2
     index = faiss.index_factory(config.d, _factory_string(config), metric_flag)
-    # extract_index_ivf reaches through IndexPreTransform (OPQ) to set cp.niter
-    faiss.extract_index_ivf(index).cp.niter = config.niter
+    if config.hnsw_m == 0:
+        # .cp is on the flat quantizer only; HNSW quantizer uses its own graph params
+        faiss.extract_index_ivf(index).cp.niter = config.niter
 
     # --- train ---
     trained_path = out / f"{name}_trained.index"
@@ -133,6 +149,7 @@ def build_index(
             "total_s": round(train_s + add_s, 2),
         },
         "built_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "omp_threads": faiss.omp_get_max_threads(),
     }
     meta_path.write_text(json.dumps(meta, indent=2))
     print(f"saved → {index_path}  ({index_path.stat().st_size / 1e6:.0f} MB)")
@@ -145,6 +162,63 @@ def build_index(
 
 def load_index(path: str) -> faiss.Index:
     return faiss.read_index(path)
+
+
+def stream_add(
+    index: faiss.Index,
+    path: str,
+    chunk_size: int = 500_000,
+    timeout_s: float | None = None,
+) -> int:
+    """Add vectors from a raw .i8bin file to a trained index without loading all into RAM.
+
+    Reads the file in chunks, casts int8→float32 per chunk, and calls index.add().
+    Supports early stop via timeout_s.
+
+    Args:
+        index:      Trained FAISS index (index.is_trained must be True).
+        path:       Path to a raw .i8bin file (4-byte n_vecs header, 4-byte dim header, then int8 data).
+        chunk_size: Vectors per chunk. Default 500K ≈ 200 MB float32.
+        timeout_s:  Stop early if elapsed >= this value. None = no limit.
+
+    Returns:
+        Number of vectors successfully added.
+    """
+    assert index.is_trained, "index must be trained before stream_add"
+
+    with open(path, "rb") as f:
+        n_vecs_header = int(np.frombuffer(f.read(4), dtype=np.int32)[0])
+        dim           = int(np.frombuffer(f.read(4), dtype=np.int32)[0])
+
+    # derive true vector count from file size — handles partial downloads where
+    # the header still reflects the full dataset (e.g. 1B header on a 100M file)
+    n_vecs_file = (Path(path).stat().st_size - 8) // dim
+    n_vecs = n_vecs_file
+    if n_vecs != n_vecs_header:
+        print(f"  header says {n_vecs_header:,} vectors; file has {n_vecs:,} — using file size")
+
+    t0 = time.perf_counter()
+    n_added = 0
+
+    with open(path, "rb") as f:
+        f.seek(8)  # skip header
+        while n_added < n_vecs:
+            batch = min(chunk_size, n_vecs - n_added)
+            raw   = np.frombuffer(f.read(batch * dim), dtype=np.int8).reshape(batch, dim)
+            index.add(raw.astype(np.float32))
+            n_added += batch
+
+            elapsed = time.perf_counter() - t0
+            qps     = n_added / elapsed
+            print(f"  added {n_added:,}/{n_vecs:,}  ({elapsed:.1f}s, {qps:.0f} vecs/s)")
+
+            if timeout_s is not None and elapsed >= timeout_s:
+                print(f"  early stop: {elapsed:.1f}s >= {timeout_s}s ({n_added:,}/{n_vecs:,} added)")
+                break
+
+    elapsed = time.perf_counter() - t0
+    print(f"stream_add done: {n_added:,} vectors in {elapsed:.1f}s  ({n_added / elapsed:.0f} vecs/s avg)")
+    return n_added
 
 
 def dump_debug(

@@ -82,6 +82,7 @@ def benchmark_search(
         "nq":               nq,
         "k":                k,
         "nprobe":           nprobe,
+        "omp_threads":      faiss.omp_get_max_threads(),
     }
 
 

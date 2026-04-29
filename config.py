@@ -12,6 +12,7 @@ class IndexConfig:
     niter: int = 10               # k-means iterations for coarse quantizer + PQ
     chunk_size: int = 500_000     # vectors per add() call
     opq: bool = False             # OPQ rotation; enable for high-dim uneven embeddings
+    hnsw_m: int = 0              # HNSW neighbors per node; 0 = flat quantizer, 32 = HNSW32
 
     def __post_init__(self):
         if self.d % self.M != 0:
